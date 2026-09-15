@@ -2594,6 +2594,7 @@ static void reclaim_ramblock(RAMBlock *block)
         ram_block_coordinated_discard_require(false);
     }
 
+    g_free(block->sail_base_dirty);
     g_free(block);
 }
 
@@ -4093,6 +4094,7 @@ int qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque)
  */
 int ram_block_discard_range(RAMBlock *rb, uint64_t offset, size_t length)
 {
+    qatomic_set(&rb->sail_base_discarded, true);
     int ret = -1;
 
     uint8_t *host_startaddr = rb->host + offset;

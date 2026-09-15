@@ -1,0 +1,41 @@
+name: Sail RAM base qualification
+on:
+  workflow_dispatch:
+  push:
+    branches: [sail/checkpoint-ram-v1]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the Sail fork
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-venv ninja-build pkg-config libglib2.0-dev libpixman-1-dev zlib1g-dev libfdt-dev libslirp-dev liburing-dev
+          mkdir build
+          cd build
+          ../configure --target-list=x86_64-softmmu --disable-docs --disable-gtk --disable-sdl --disable-werror
+          ninja -j4 qemu-system-x86_64
+          sha256sum qemu-system-x86_64 > runtime.sha256
+      - name: Qualify TCG and KVM RAM epochs
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+          set -o pipefail
+          for accelerator in tcg kvm; do
+            for machine in microvm q35; do
+              python3 tests/sail/ram_base_test.py ./build/qemu-system-x86_64 --accel "$accelerator" --machine "$machine"
+            done
+          done | tee build/qualification.jsonl
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sail-qemu-ram-base-${{ github.sha }}
+          path: |
+            build/qemu-system-x86_64
+            build/runtime.sha256
+            build/qualification.jsonl
+          retention-days: 7

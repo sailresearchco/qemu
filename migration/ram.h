@@ -61,6 +61,8 @@
 #define RAM_SAVE_FLAG_XBZRLE                  0x040
 #define RAM_SAVE_FLAG_HOOK                    0x080
 #define RAM_SAVE_FLAG_MULTIFD_FLUSH           0x200
+/* Sail-only format extension; stock QEMU must reject these streams. */
+#define RAM_SAVE_FLAG_SAIL_BASE               0x100
 
 extern XBZRLECacheStats xbzrle_counters;
 

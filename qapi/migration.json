@@ -2233,3 +2233,90 @@
   'data': { 'job-id': 'str',
             'tag': 'str',
             'devices': ['str'] } }
+
+##
+# @SailRAMBaseInfo:
+#
+# Sail fork RAM base status.  The base is retained across completed
+# and
+# failed
+# migration jobs.  This interface is experimental and not an upstream
+# QEMU API.
+#
+# @id: Caller-assigned immutable base identity (64 lowercase
+#     hexadecimal digits).
+# @valid: Whether RAM topology and discard history still permit reuse.
+# @selected: Whether the next native stream omits RAM unchanged since
+#     this base.
+# @dirty-bytes: Conservative changed RAM byte count; available between
+#     migrations.
+#
+# Since: 11.0
+##
+{ 'struct': 'SailRAMBaseInfo', 'data':
+  { 'id': 'str', 'valid': 'bool', 'selected': 'bool', 'dirty-bytes': 'uint64' } }
+
+##
+# @x-sail-ram-base-create:
+#
+# Save a paused VM's RAM and begin checkpoint-relative dirty tracking.
+# The
+# caller must seal disks and retain matching native CPU/device state
+# separately.
+# Existing files are never overwritten.  The caller owns
+# authentication,
+# publication, base retention, and compatibility beyond the RAM
+# layout.
+#
+# @filename: Absolute local destination path.
+# @id: Unique immutable base identity, never reused for different
+#     bytes.
+#
+# Since: 11.0
+##
+{ 'command': 'x-sail-ram-base-create',
+  'data': { 'filename': 'str', 'id': 'str' }, 'returns': 'SailRAMBaseInfo' }
+
+##
+# @x-sail-ram-base-load:
+#
+# Seed RAM in a fresh incoming VM from authenticated local base bytes.
+# Must be
+# followed by a matching base-relative native stream; the VM stays
+# stopped.
+# A failed load leaves RAM unspecified and the caller must discard the
+# VM.
+#
+# @filename: Absolute local base path whose complete bytes the caller
+#     verified.
+# @id: Expected immutable base identity.
+#
+# Since: 11.0
+##
+{ 'command': 'x-sail-ram-base-load',
+  'data': { 'filename': 'str', 'id': 'str' }, 'returns': 'SailRAMBaseInfo' }
+
+##
+# @x-sail-ram-base-select:
+#
+# Select base-relative or ordinary full native migration without
+# clearing the
+# retained dirty set.  Only available between migration jobs.
+#
+# @id: Expected retained base identity.
+# @enabled: Select base-relative migration when true.
+#
+# Since: 11.0
+##
+{ 'command': 'x-sail-ram-base-select',
+  'data': { 'id': 'str', 'enabled': 'bool' }, 'returns': 'SailRAMBaseInfo' }
+
+##
+# @query-sail-ram-base:
+#
+# Observe the retained RAM base, collecting pending dirty logs between
+# jobs.
+#
+# Since: 11.0
+##
+{ 'command': 'query-sail-ram-base', 'returns': 'SailRAMBaseInfo' }

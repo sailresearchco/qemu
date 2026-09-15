@@ -78,7 +78,8 @@ static inline void fuzz_dma_read_cb(size_t addr,
 /* Dirty tracking enabled because dirty limit */
 #define GLOBAL_DIRTY_LIMIT      (1U << 2)
 
-#define GLOBAL_DIRTY_MASK  (0x7)
+#define GLOBAL_DIRTY_SAIL_BASE (1U << 3)
+#define GLOBAL_DIRTY_MASK  (0xf)
 
 extern unsigned int global_dirty_tracking;
 

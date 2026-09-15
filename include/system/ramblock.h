@@ -46,6 +46,11 @@ struct RAMBlock {
     /* dirty bitmap used during migration */
     unsigned long *bmap;
 
+    /* Sail fork: dirty pages since the retained RAM base, across migrations. */
+    unsigned long *sail_base_dirty;
+    ram_addr_t sail_base_length;
+    bool sail_base_discarded;
+
     /*
      * Below fields are only used by mapped-ram migration
      */

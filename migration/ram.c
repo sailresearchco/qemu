@@ -275,7 +275,12 @@ bool ramblock_recv_bitmap_test_byte_offset(RAMBlock *rb, uint64_t byte_offset)
 
 void ramblock_recv_bitmap_set(RAMBlock *rb, void *host_addr)
 {
-    set_bit_atomic(ramblock_recv_bitmap_offset(host_addr, rb), rb->receivedmap);
+    set_bit_atomic(ramblock_recv_bitmap_offset(host_addr, rb),
+                    rb->receivedmap);
+    if (rb->sail_base_dirty) {
+        set_bit_atomic(ramblock_recv_bitmap_offset(host_addr, rb),
+                       rb->sail_base_dirty);
+    }
 }
 
 void ramblock_recv_bitmap_set_range(RAMBlock *rb, void *host_addr,
@@ -284,11 +289,18 @@ void ramblock_recv_bitmap_set_range(RAMBlock *rb, void *host_addr,
     bitmap_set_atomic(rb->receivedmap,
                       ramblock_recv_bitmap_offset(host_addr, rb),
                       nr);
+    if (rb->sail_base_dirty) {
+        bitmap_set_atomic(rb->sail_base_dirty,
+                          ramblock_recv_bitmap_offset(host_addr, rb), nr);
+    }
 }
 
 void ramblock_recv_bitmap_set_offset(RAMBlock *rb, uint64_t byte_offset)
 {
     set_bit_atomic(byte_offset >> TARGET_PAGE_BITS, rb->receivedmap);
+    if (rb->sail_base_dirty) {
+        set_bit_atomic(byte_offset >> TARGET_PAGE_BITS, rb->sail_base_dirty);
+    }
 }
 #define  RAMBLOCK_RECV_BITMAP_ENDING  (0x0123456789abcdefULL)
 
@@ -438,6 +450,34 @@ struct RAMState {
 typedef struct RAMState RAMState;
 
 static RAMState *ram_state;
+
+/* Source base identity and selection are independent of a migration job. */
+static char sail_base_id[65];
+static unsigned int sail_base_version;
+static bool sail_base_selected;
+static bool sail_base_loaded;
+static bool sail_base_header_seen;
+static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
+                                                  ram_addr_t start,
+                                                  ram_addr_t length);
+
+static bool sail_base_valid(void)
+{
+    RAMBlock *rb;
+    RCU_READ_LOCK_GUARD();
+
+    if (!sail_base_id[0] || sail_base_version != ram_list.version) {
+        return false;
+    }
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        if (!rb->sail_base_dirty || qatomic_read(&rb->sail_base_discarded) ||
+            rb->used_length != rb->sail_base_length) {
+            return false;
+        }
+    }
+    return true;
+}
+
 
 static NotifierWithReturnList precopy_notifier_list;
 
@@ -966,6 +1006,9 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
                 unsigned long new_dirty;
                 new_dirty = ~dest[k];
                 dest[k] |= bits;
+                if (rb->sail_base_dirty) {
+                    rb->sail_base_dirty[k] |= bits;
+                }
                 new_dirty &= bits;
                 num_dirty += ctpopl(new_dirty);
             }
@@ -975,8 +1018,8 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
                 idx++;
             }
         }
-        if (num_dirty) {
-            physical_memory_dirty_bits_cleared(start, length);
+        if (length && (num_dirty || rb->sail_base_dirty)) {
+            physical_memory_dirty_bits_cleared(start + rb->offset, length);
         }
 
         if (rb->clear_bmap) {
@@ -997,9 +1040,336 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
                         length,
                         DIRTY_MEMORY_MIGRATION,
                         dest);
+        if (rb->sail_base_dirty) {
+            /* Small unaligned regions can over-report, never miss a write. */
+            bitmap_or(rb->sail_base_dirty, rb->sail_base_dirty, dest,
+                      rb->used_length >> TARGET_PAGE_BITS);
+            if (length) {
+                physical_memory_dirty_bits_cleared(start + rb->offset, length);
+            }
+        }
     }
 
     return num_dirty;
+}
+
+/*
+ * Sail fork: local RAM artifacts, independent of native CPU/device streams.
+ * Storage authorization and content validation belong to the artifact owner.
+ */
+static bool sail_base_idle(Error **errp)
+{
+    if (migration_is_running() || ram_state) {
+        error_setg(errp, "Sail RAM base operation requires migration cleanup");
+        return false;
+    }
+    return true;
+}
+
+static bool sail_base_id_valid(const char *id, Error **errp)
+{
+    if (strlen(id) != 64 || strspn(id, "0123456789abcdef") != 64) {
+        error_setg(errp, "Sail RAM base identity must be 64 lowercase hex digits");
+        return false;
+    }
+    return true;
+}
+
+static bool sail_base_geometry(Error **errp)
+{
+    RAMBlock *rb;
+    RCU_READ_LOCK_GUARD();
+
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        if (rb->flags & (RAM_SHARED | RAM_PMEM | RAM_PROTECTED | RAM_GUEST_MEMFD) ||
+            memory_region_has_ram_discard_manager(rb->mr)) {
+            error_setg(errp, "Sail RAM base requires fixed private RAM: %s", rb->idstr);
+            return false;
+        }
+    }
+    return true;
+}
+
+/*
+ * Drain hardware logs without destroying checkpoint-relative history. This
+ * also sees CPU/device writes between separate migration operations.
+ */
+static void sail_base_collect(void)
+{
+    RAMBlock *rb;
+    RCU_READ_LOCK_GUARD();
+
+    if (!sail_base_valid()) {
+        return;
+    }
+    memory_global_dirty_log_sync(false);
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        assert(!rb->bmap && !rb->clear_bmap);
+        rb->bmap = rb->sail_base_dirty;
+        physical_memory_sync_dirty_bitmap(rb, 0, rb->used_length);
+        rb->bmap = NULL;
+    }
+    memory_global_after_dirty_log_sync();
+}
+
+static bool sail_base_begin(const char *id, Error **errp)
+{
+    RAMBlock *rb;
+    RCU_READ_LOCK_GUARD();
+
+    sail_base_selected = false;
+    sail_base_loaded = false;
+    sail_base_id[0] = 0;
+    if (!memory_global_dirty_log_start(GLOBAL_DIRTY_SAIL_BASE, errp)) {
+        return false;
+    }
+    memory_global_dirty_log_sync(false);
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        g_free(rb->sail_base_dirty);
+        rb->sail_base_dirty = bitmap_new(rb->max_length >> TARGET_PAGE_BITS);
+        rb->sail_base_length = rb->used_length;
+        rb->sail_base_discarded = false;
+        assert(!rb->bmap && !rb->clear_bmap);
+        rb->bmap = rb->sail_base_dirty;
+        physical_memory_sync_dirty_bitmap(rb, 0, rb->used_length);
+        rb->bmap = NULL;
+        bitmap_zero(rb->sail_base_dirty, rb->max_length >> TARGET_PAGE_BITS);
+    }
+    memory_global_after_dirty_log_sync();
+    pstrcpy(sail_base_id, sizeof(sail_base_id), id);
+    sail_base_version = ram_list.version;
+    return true;
+}
+
+static SailRAMBaseInfo *sail_base_info(void)
+{
+    SailRAMBaseInfo *info = g_new0(SailRAMBaseInfo, 1);
+    RAMBlock *rb;
+    RCU_READ_LOCK_GUARD();
+
+    info->id = g_strdup(sail_base_id);
+    info->valid = sail_base_valid();
+    info->selected = sail_base_selected;
+    if (info->valid) {
+        RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+            info->dirty_bytes += bitmap_count_one(rb->sail_base_dirty,
+                rb->used_length >> TARGET_PAGE_BITS) << TARGET_PAGE_BITS;
+        }
+    }
+    return info;
+}
+
+SailRAMBaseInfo *qmp_query_sail_ram_base(Error **errp)
+{
+    if (!sail_base_idle(errp)) {
+        return NULL;
+    }
+    sail_base_collect();
+    return sail_base_info();
+}
+
+SailRAMBaseInfo *qmp_x_sail_ram_base_select(const char *id, bool enabled,
+                                         Error **errp)
+{
+    if (!sail_base_idle(errp)) {
+        return NULL;
+    }
+    if (enabled && (!sail_base_valid() || strcmp(id, sail_base_id))) {
+        error_setg(errp, "Sail RAM base is absent, invalid, or mismatched");
+        return NULL;
+    }
+    sail_base_collect();
+    sail_base_selected = enabled;
+    return sail_base_info();
+}
+
+static bool sail_base_io(int fd, void *buffer, size_t size, bool load,
+                         Error **errp)
+{
+    uint8_t *p = buffer;
+    while (size) {
+        ssize_t n = load ? read(fd, p, size) : write(fd, p, size);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            error_setg(errp, "Sail RAM base %s: %s", load ? "read" : "write",
+                       n < 0 ? strerror(errno) : "unexpected end of file");
+            return false;
+        }
+        p += n;
+        size -= n;
+    }
+    return true;
+}
+
+static bool sail_base_header(int fd, const char *id, bool load, Error **errp)
+{
+    uint8_t expected[72] = "SAILRAM1", actual[72];
+
+    memcpy(expected + 8, id, 64);
+    if (!load) {
+        return sail_base_io(fd, expected, sizeof(expected), false, errp);
+    }
+    if (!sail_base_io(fd, actual, sizeof(actual), true, errp)) {
+        return false;
+    }
+    if (memcmp(actual, expected, sizeof(expected))) {
+        error_setg(errp, "Sail RAM base file identity mismatch");
+        return false;
+    }
+    return true;
+}
+
+/*
+ * Header + a sequence of (name length, name, BE64 size, RAM bytes) in QEMU's
+ * RAMBlock order. No pointers, host offsets or object-store URLs are persisted.
+ * A validation pass precedes incoming writes. Artifact bytes are authenticated
+ * by Sail before this API; the ID binds that artifact to the native delta.
+ */
+static bool sail_base_blocks(int fd, bool load, bool validate_only, Error **errp)
+{
+    RAMBlock *rb;
+    uint8_t header[264], expected[264];
+    RCU_READ_LOCK_GUARD();
+
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        size_t name_len = strlen(rb->idstr);
+        size_t header_len = 1 + name_len + 8;
+        uint64_t length = cpu_to_be64(rb->used_length);
+        uint64_t offset;
+
+        assert(name_len < 256);
+        expected[0] = name_len;
+        memcpy(expected + 1, rb->idstr, name_len);
+        memcpy(expected + 1 + name_len, &length, 8);
+        if (load) {
+            if (!sail_base_io(fd, header, header_len, true, errp)) {
+                return false;
+            }
+            if (memcmp(header, expected, header_len)) {
+                error_setg(errp, "Sail RAM base layout mismatch at %s", rb->idstr);
+                return false;
+            }
+        } else if (!sail_base_io(fd, expected, header_len, false, errp)) {
+            return false;
+        }
+        if (validate_only) {
+            if (lseek(fd, rb->used_length, SEEK_CUR) < 0) {
+                error_setg_errno(errp, errno, "Seek Sail RAM base");
+                return false;
+            }
+            continue;
+        }
+        for (offset = 0; offset < rb->used_length; offset += 1 << 20) {
+            size_t size = MIN(1 << 20, rb->used_length - offset);
+            void *data = rb->host + offset;
+            if (!load && buffer_is_zero(data, size)) {
+                if (lseek(fd, size, SEEK_CUR) < 0) {
+                    error_setg_errno(errp, errno, "Extend sparse Sail RAM base");
+                    return false;
+                }
+            } else if (!sail_base_io(fd, data, size, load, errp)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+SailRAMBaseInfo *qmp_x_sail_ram_base_create(const char *filename, const char *id,
+                                          Error **errp)
+{
+    int fd;
+    bool ok;
+    off_t size;
+
+    if (!sail_base_idle(errp) || !sail_base_id_valid(id, errp) ||
+        !sail_base_geometry(errp)) {
+        return NULL;
+    }
+    if (runstate_is_running() || !g_path_is_absolute(filename) ||
+        !strcmp(id, sail_base_id)) {
+        error_setg(errp, "Sail RAM capture requires paused CPUs, "
+                   "absolute path and fresh ID");
+        return NULL;
+    }
+    fd = open(filename, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "Create Sail RAM base");
+        return NULL;
+    }
+    /*
+     * Start the new epoch before copying, so any asynchronous writes during
+     * capture remain dirty. On failure the caller falls back to full capture.
+     */
+    ok = sail_base_begin(id, errp) && sail_base_header(fd, id, false, errp) &&
+         sail_base_blocks(fd, false, false, errp);
+    if (ok) {
+        size = lseek(fd, 0, SEEK_CUR);
+        if (size < 0 || ftruncate(fd, size) < 0 || fsync(fd) < 0) {
+            error_setg_errno(errp, errno, "Seal Sail RAM base");
+            ok = false;
+        }
+    }
+    if (close(fd) < 0 && ok) {
+        error_setg_errno(errp, errno, "Close Sail RAM base");
+        ok = false;
+    }
+    if (!ok) {
+        sail_base_id[0] = 0;
+        unlink(filename);
+        return NULL;
+    }
+    return sail_base_info();
+}
+
+SailRAMBaseInfo *qmp_x_sail_ram_base_load(const char *filename, const char *id,
+                                        Error **errp)
+{
+    struct stat st;
+    int fd;
+    bool ok;
+
+    if (!sail_base_idle(errp) || !sail_base_id_valid(id, errp) ||
+        !sail_base_geometry(errp)) {
+        return NULL;
+    }
+    if (!runstate_check(RUN_STATE_INMIGRATE) ||
+        !g_path_is_absolute(filename) || sail_base_id[0]) {
+        error_setg(errp, "Sail RAM seed requires a fresh deferred incoming VM");
+        return NULL;
+    }
+    fd = open(filename, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        error_setg_errno(errp, errno, "Open Sail RAM base");
+        return NULL;
+    }
+    if (fstat(fd, &st) < 0 || !S_ISREG(st.st_mode)) {
+        error_setg(errp, "Sail RAM base must be a regular file");
+        close(fd);
+        return NULL;
+    }
+    ok = sail_base_header(fd, id, true, errp) &&
+         sail_base_blocks(fd, true, true, errp);
+    if (ok && lseek(fd, 0, SEEK_CUR) != st.st_size) {
+        error_setg(errp, "Sail RAM base file size mismatch");
+        ok = false;
+    }
+    if (ok && lseek(fd, 72, SEEK_SET) != 72) {
+        error_setg_errno(errp, errno, "Rewind Sail RAM base");
+        ok = false;
+    }
+    if (ok) {
+        ok = sail_base_begin(id, errp) && sail_base_blocks(fd, true, false, errp);
+    }
+    close(fd);
+    if (!ok) {
+        sail_base_id[0] = 0;
+        return NULL;
+    }
+    sail_base_loaded = true;
+    return sail_base_info();
 }
 
 /* Called with RCU critical section */
@@ -2848,7 +3218,11 @@ static void ram_list_init_bitmaps(void)
              * guest memory.
              */
             block->bmap = bitmap_new(pages);
-            bitmap_set(block->bmap, 0, pages);
+            if (sail_base_selected) {
+                bitmap_copy(block->bmap, block->sail_base_dirty, pages);
+            } else {
+                bitmap_set(block->bmap, 0, pages);
+            }
             if (migrate_mapped_ram()) {
                 block->file_bmap = bitmap_new(pages);
             }
@@ -2879,6 +3253,14 @@ static bool ram_init_bitmaps(RAMState *rs, Error **errp)
 
     WITH_RCU_READ_LOCK_GUARD() {
         ram_list_init_bitmaps();
+        if (sail_base_selected) {
+            RAMBlock *rb;
+            rs->migration_dirty_pages = 0;
+            RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+                rs->migration_dirty_pages += bitmap_count_one(rb->bmap,
+                    rb->used_length >> TARGET_PAGE_BITS);
+            }
+        }
         /* We don't use dirty log with background snapshots */
         if (!migrate_background_snapshot()) {
             ret = memory_global_dirty_log_start(GLOBAL_DIRTY_MIGRATION, errp);
@@ -3118,6 +3500,12 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
 
     assert(!migration_in_colo_state());
 
+    if (sail_base_selected && (!sail_base_valid() || migrate_mapped_ram() ||
+        migrate_postcopy_ram() || migrate_background_snapshot() ||
+        migrate_ignore_shared() || migrate_xbzrle() || migrate_colo())) {
+        error_setg(errp, "Sail RAM base is invalid or migration mode is unsupported");
+        return -1;
+    }
     if (ram_init_all(rsp, errp) != 0) {
         return -1;
     }
@@ -3131,6 +3519,10 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
     max_hg_page_size = MAX(qemu_real_host_page_size(), TARGET_PAGE_SIZE);
 
     WITH_RCU_READ_LOCK_GUARD() {
+        if (sail_base_selected) {
+            qemu_put_be64(f, RAM_SAVE_FLAG_SAIL_BASE);
+            qemu_put_buffer(f, (const uint8_t *)sail_base_id, 64);
+        }
         qemu_put_be64(f, ram_bytes_total_with_ignored()
                          | RAM_SAVE_FLAG_MEM_SIZE);
 
@@ -3262,6 +3654,11 @@ static int ram_save_iterate(QEMUFile *f, void *opaque)
     int64_t t0;
     int done = 0;
 
+    if (sail_base_selected && !sail_base_valid()) {
+        qemu_file_set_error(f, -EINVAL);
+        return -EINVAL;
+    }
+
     /*
      * We'll take this lock a little bit long, but it's okay for two reasons.
      * Firstly, the only possible other thread to take it is who calls
@@ -3372,6 +3769,10 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
     RAMState *rs = *temp;
     int ret = 0;
 
+    if (sail_base_selected && !sail_base_valid()) {
+        qemu_file_set_error(f, -EINVAL);
+        return -EINVAL;
+    }
     trace_ram_save_complete(rs->migration_dirty_pages, 0);
 
     rs->last_stage = !migration_in_colo_state();
@@ -3760,6 +4161,7 @@ void colo_release_ram_cache(void)
  */
 static int ram_load_setup(QEMUFile *f, void *opaque, Error **errp)
 {
+    sail_base_header_seen = false;
     xbzrle_load_setup();
     ramblock_recv_map_init();
 
@@ -4287,6 +4689,9 @@ static int parse_ramblocks(QEMUFile *f, ram_addr_t total_ram_bytes)
 
         block = qemu_ram_block_by_name(id);
         if (block) {
+            if (sail_base_header_seen && length != block->used_length) {
+                return -EINVAL;
+            }
             ret = parse_ramblock(f, block, length);
         } else {
             error_report("Unknown ramblock \"%s\", cannot accept "
@@ -4395,7 +4800,24 @@ static int ram_load_precopy(QEMUFile *f)
         }
 
         switch (flags & ~RAM_SAVE_FLAG_CONTINUE) {
+        case RAM_SAVE_FLAG_SAIL_BASE: {
+            char id[65] = { 0 };
+            qemu_get_buffer(f, (uint8_t *)id, 64);
+            if (sail_base_header_seen || !sail_base_loaded ||
+                !sail_base_valid() || strcmp(id, sail_base_id)) {
+                error_report("Sail migration RAM base identity mismatch");
+                ret = -EINVAL;
+                break;
+            }
+            sail_base_header_seen = true;
+            break;
+        }
         case RAM_SAVE_FLAG_MEM_SIZE:
+            if (sail_base_loaded && !sail_base_header_seen) {
+                error_report("Sail preloaded RAM requires a base-relative stream");
+                ret = -EINVAL;
+                break;
+            }
             ret = parse_ramblocks(f, addr);
             /*
              * For mapped-ram migration (to a file) using multifd, we sync

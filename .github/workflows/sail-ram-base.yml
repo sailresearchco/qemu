@@ -39,3 +39,36 @@ jobs:
             build/runtime.sha256
             build/qualification.jsonl
           retention-days: 7
+  al2023:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    container: amazonlinux:2023.12.20260817.0@sha256:fa946e513ed149232490479653141fa4c6cd1e71c70130525cf00a791477ed19
+    steps:
+      - name: Native build dependencies
+        run: |
+          dnf -y --releasever=2023.12.20260831 --setopt=install_weak_deps=False upgrade
+          dnf -y --releasever=2023.12.20260831 --setopt=install_weak_deps=False install git gcc gcc-c++ make ninja-build python3 python3-pip python3-setuptools python3-wheel python3-tomli glib2-devel pixman-devel libseccomp-devel libfdt-devel zlib-devel capstone-devel binutils tar gzip bzip2 xz findutils
+      - uses: actions/checkout@v4
+      - name: Build isolated AL2023 runtime
+        run: |
+          mkdir build
+          cd build
+          ../configure --prefix=/opt/sailbox/qemu/sail-${GITHUB_SHA} --target-list=x86_64-softmmu --with-default-devices --without-default-features --enable-kvm --enable-seccomp --enable-pixman --enable-fdt=system --enable-capstone --enable-tools --disable-tcg --disable-modules --disable-rust --disable-docs --disable-user
+          make -j4
+          make DESTDIR=/tmp/sail-native install
+          mkdir evidence
+          rpm -qa --qf '%{NEVRA}\n' | sort > evidence/packages.txt
+          cp config-host.mak config-host.h x86_64-softmmu-config-devices.mak evidence/
+          ldd qemu-system-x86_64 > evidence/ldd.txt
+          cp ../LICENSE ../COPYING ../COPYING.LIB /tmp/sail-native/opt/sailbox/qemu/sail-${GITHUB_SHA}/share/qemu/
+          tar -czf runtime-al2023.tar.gz -C /tmp/sail-native .
+          sha256sum runtime-al2023.tar.gz > runtime-al2023.sha256
+          printf '%s\n' "$GITHUB_SHA" > evidence/source.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sail-qemu-al2023-${{ github.sha }}
+          path: |
+            build/runtime-al2023.tar.gz
+            build/runtime-al2023.sha256
+            build/evidence/
+          retention-days: 7

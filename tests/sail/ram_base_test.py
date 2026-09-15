@@ -185,6 +185,14 @@ def main():
         info = source.command('x-sail-ram-base-create', filename=str(base), id=base_id)
         assert info['valid'] and info['dirty-bytes'] == 0, info
         assert base.stat().st_size >= 128 << 20
+        # A deferred receiver may be seeded, but not changed after listening.
+        pending = vm('pending', True)
+        pending.command('x-sail-ram-base-load', filename=str(base), id=base_id)
+        pending.command('migrate-incoming', uri='unix:' + str(root / 'pending.sock'))
+        rejects(lambda: pending.command('query-sail-ram-base'), 'cleanup')
+        rejects(lambda: pending.command('x-sail-ram-base-select', id=base_id, enabled=True), 'cleanup')
+        rejects(lambda: pending.command('x-sail-ram-base-create', filename=str(root / 'pending.ram'), id='c' * 64), 'cleanup')
+        pending.close()
         before = source.read(0x70000, 4)
         source.command('cont')
         time.sleep(.1)

@@ -1059,7 +1059,12 @@ static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
  */
 static bool sail_base_idle(Error **errp)
 {
-    if (migration_is_running() || ram_state) {
+    MigrationIncomingState *mis = migration_incoming_get_current();
+
+    /* The outgoing migration state does not cover an active receiver. */
+    if (migration_is_running() || ram_state ||
+        (mis && mis->state != MIGRATION_STATUS_NONE &&
+         mis->state != MIGRATION_STATUS_COMPLETED)) {
         error_setg(errp, "Sail RAM base operation requires migration cleanup");
         return false;
     }

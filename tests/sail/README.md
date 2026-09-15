@@ -28,3 +28,21 @@ small accumulated dirty set across another move. This fixture does not touch
 all guest RAM after restore: KVM can conservatively dirty newly mapped writable
 pages on their first access, including reads. A full guest workload benchmark
 must measure that case separately; the persistent bitmap does not eliminate it.
+
+New captures use SAILRAM2, with each RAM block aligned to 4096 bytes. On Linux,
+loading privately maps eligible fixed anonymous blocks at their existing host
+addresses, so the kernel faults in base pages only when needed. Incoming delta
+writes are copy-on-write. Legacy SAILRAM1 bases and ineligible allocations keep
+the eager reader. No source connection or object-store access lives in QEMU.
+The caller must authenticate and retain immutable local bytes: it may unlink
+the private base path after loading, but must not rewrite or truncate its inode
+while a VM maps it. The mapping retains the inode until process exit.
+
+Mapped RAM retains anonymous discard semantics: discard replaces the range
+with anonymous zero pages, never MADV_DONTNEED (which would reveal old file
+bytes). Discard still invalidates the epoch. The qualification checks mapping
+residency before guest access, old-format restore, truncated-file rejection,
+copy-on-write isolation, repeated discard, and reads after the path is unlinked.
+Its explicit qtest socket has a Sail-only discard hook for this boundary; the
+production QMP API does not expose that test operation. This is local lazy
+loading, not a lazy S3 source: Sail still prepares the complete local base.

@@ -148,6 +148,42 @@ def rejects(fn, contains):
         raise AssertionError('operation unexpectedly accepted')
 
 
+def legacy_base(source, target):
+    """Re-encode the same epoch with the old unaligned file layout."""
+    with source.open('rb') as src, target.open('wb') as dst:
+        header = src.read(72)
+        assert header[:8] == b'SAILRAM2'
+        dst.write(b'SAILRAM1' + header[8:])
+        while first := src.read(1):
+            header = first + src.read(first[0] + 8)
+            length = int.from_bytes(header[-8:], 'big')
+            dst.write(header)
+            src.seek((src.tell() + 4095) & ~4095)
+            while length:
+                data = src.read(min(length, 1 << 20))
+                assert data
+                if data == bytes(len(data)):
+                    dst.seek(len(data), 1)
+                else:
+                    dst.write(data)
+                length -= len(data)
+        dst.truncate()
+
+
+def mapped_base_memory(vm, filename):
+    """Only the base mapping, excluding QEMU code/device/bitmap allocations."""
+    selected = False
+    values = {'Size': 0, 'Rss': 0}
+    for line in Path(f'/proc/{vm.process.pid}/smaps').read_text().splitlines():
+        if line and line[0] in '0123456789abcdef' and '-' in line.split()[0]:
+            selected = str(filename) in line
+        elif selected and ':' in line:
+            key, value = line.split(':', 1)
+            if key in values:
+                values[key] += int(value.split()[0]) * 1024
+    return values
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('binary')
@@ -185,6 +221,41 @@ def main():
         info = source.command('x-sail-ram-base-create', filename=str(base), id=base_id)
         assert info['valid'] and info['dirty-bytes'] == 0, info
         assert base.stat().st_size >= 128 << 20
+        with base.open('rb') as f:
+            base_hash = hashlib.file_digest(f, 'sha256').hexdigest()
+        # Validate lazy mapping before any guest reads could fault base pages.
+        lazy = vm('lazy', True)
+        started = time.monotonic()
+        lazy.command('x-sail-ram-base-load', filename=str(base), id=base_id)
+        lazy_seconds = time.monotonic() - started
+        memory = mapped_base_memory(lazy, base)
+        assert memory['Size'] >= args.memory_mib * (1 << 20), memory
+        assert memory['Rss'] < 4 << 20, memory
+        assert lazy.read(16 << 20, len(payload)) == payload
+        lazy.write(16 << 20, b'\x55' * 4096)
+        lazy.test(f'sail-ram-discard pc.ram {16 << 20:#x} 4096')
+        assert lazy.read(16 << 20, 4096) == bytes(4096)
+        assert not lazy.base_info()['valid']
+        # Discarding twice must not resurrect the file's original bytes.
+        lazy.write(16 << 20, b'\x77' * 4096)
+        lazy.test(f'sail-ram-discard pc.ram {16 << 20:#x} 4096')
+        assert lazy.read(16 << 20, 4096) == bytes(4096)
+        lazy.close()
+        # Old durable bases continue to restore through the eager reader.
+        legacy = root / 'legacy.ram'
+        legacy_base(base, legacy)
+        old = vm('legacy', True)
+        old.command('x-sail-ram-base-load', filename=str(legacy), id=base_id)
+        assert old.read(16 << 20, len(payload)) == payload
+        old.close()
+        truncated = root / 'truncated.ram'
+        shutil.copyfile(base, truncated)
+        with truncated.open('r+b') as f:
+            f.truncate(truncated.stat().st_size - 1)
+        invalid = vm('truncated', True)
+        rejects(lambda: invalid.command('x-sail-ram-base-load', filename=str(truncated), id=base_id), 'size')
+        assert mapped_base_memory(invalid, truncated)['Size'] == 0
+        invalid.close()
         # A deferred receiver may be seeded, but not changed after listening.
         pending = vm('pending', True)
         pending.command('x-sail-ram-base-load', filename=str(base), id=base_id)
@@ -253,7 +324,10 @@ def main():
         destination.save(third)
         assert third.stat().st_size < full.stat().st_size // 8, third.stat().st_size
         final = vm('final', True)
-        final.command('x-sail-ram-base-load', filename=str(base), id=base_id)
+        unlinked = root / 'unlinked.ram'
+        shutil.copyfile(base, unlinked)
+        final.command('x-sail-ram-base-load', filename=str(unlinked), id=base_id)
+        unlinked.unlink()
         final.load(third)
         assert final.read(16 << 20, len(payload)) == changed
         assert final.read(0x70000, 4) == destination.read(0x70000, 4)
@@ -278,9 +352,12 @@ def main():
         time.sleep(.02)
         final.command('stop')
         assert final.base_info()['dirty-bytes'] >= 4096
+        with base.open('rb') as f:
+            assert hashlib.file_digest(f, 'sha256').hexdigest() == base_hash
         print(json.dumps({'accel': args.accel, 'machine': args.machine, 'full_bytes': full.stat().st_size,
                           'delta_bytes': delta.stat().st_size, 'followup_bytes': third.stat().st_size,
-                          'first_dirty_bytes': first_dirty, 'correctness': 'passed'}))
+                          'first_dirty_bytes': first_dirty, 'lazy_load_seconds': lazy_seconds,
+                          'base_mapping': memory, 'correctness': 'passed'}))
 
 
 if __name__ == '__main__':

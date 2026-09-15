@@ -12,6 +12,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "system/ramblock.h"
 #include "qapi/error.h"
 #include "system/qtest.h"
 #include "system/runstate.h"
@@ -647,6 +648,24 @@ static void qtest_process_command(CharFrontend *chr, gchar **words)
         g_free(data);
 
         qtest_send(chr, "OK\n");
+    } else if (strcmp(words[0], "sail-ram-discard") == 0) {
+        /* Exercise real discard semantics without a guest balloon driver.
+         * Only the explicit test socket exposes this fork qualification hook.
+         */
+        uint64_t offset, length;
+        RAMBlock *rb;
+
+        g_assert(words[1] && words[2] && words[3]);
+        g_assert(qemu_strtou64(words[2], NULL, 0, &offset) == 0);
+        g_assert(qemu_strtou64(words[3], NULL, 0, &length) == 0);
+        rb = qemu_ram_block_by_name(words[1]);
+        if (!rb || length > SIZE_MAX || offset > rb->max_length ||
+            length > rb->max_length - offset ||
+            ram_block_discard_range(rb, offset, length)) {
+            qtest_send(chr, "FAIL RAM discard\n");
+        } else {
+            qtest_send(chr, "OK\n");
+        }
     } else if (strcmp(words[0], "memset") == 0) {
         uint64_t addr, len;
         uint8_t *data;

@@ -1208,16 +1208,22 @@ static bool sail_base_io(int fd, void *buffer, size_t size, bool load,
     return true;
 }
 
-static bool sail_base_header(int fd, const char *id, bool load, Error **errp)
+static bool sail_base_header(int fd, const char *id, bool load, bool *aligned,
+                             Error **errp)
 {
-    uint8_t expected[72] = "SAILRAM1", actual[72];
+    uint8_t expected[72] = "SAILRAM2", actual[72];
 
     memcpy(expected + 8, id, 64);
+    *aligned = true;
     if (!load) {
         return sail_base_io(fd, expected, sizeof(expected), false, errp);
     }
     if (!sail_base_io(fd, actual, sizeof(actual), true, errp)) {
         return false;
+    }
+    if (!memcmp(actual, "SAILRAM1", 8)) {
+        expected[7] = '1';
+        *aligned = false;
     }
     if (memcmp(actual, expected, sizeof(expected))) {
         error_setg(errp, "Sail RAM base file identity mismatch");
@@ -1229,10 +1235,13 @@ static bool sail_base_header(int fd, const char *id, bool load, Error **errp)
 /*
  * Header + a sequence of (name length, name, BE64 size, RAM bytes) in QEMU's
  * RAMBlock order. No pointers, host offsets or object-store URLs are persisted.
+ * SAILRAM2 aligns each block's bytes to 4096 so a private file mapping can
+ * provide untouched base pages lazily. SAILRAM1 retains its eager reader.
  * A validation pass precedes incoming writes. Artifact bytes are authenticated
  * by Sail before this API; the ID binds that artifact to the native delta.
  */
-static bool sail_base_blocks(int fd, bool load, bool validate_only, Error **errp)
+static bool sail_base_blocks(int fd, bool load, bool validate_only, bool aligned,
+                             Error **errp)
 {
     RAMBlock *rb;
     uint8_t header[264], expected[264];
@@ -1259,12 +1268,39 @@ static bool sail_base_blocks(int fd, bool load, bool validate_only, Error **errp
         } else if (!sail_base_io(fd, expected, header_len, false, errp)) {
             return false;
         }
+        if (aligned) {
+            off_t pos = lseek(fd, 0, SEEK_CUR);
+            if (pos < 0 || lseek(fd, QEMU_ALIGN_UP(pos, 4096), SEEK_SET) < 0) {
+                error_setg_errno(errp, errno, "Align Sail RAM base");
+                return false;
+            }
+        }
         if (validate_only) {
             if (lseek(fd, rb->used_length, SEEK_CUR) < 0) {
                 error_setg_errno(errp, errno, "Seek Sail RAM base");
                 return false;
             }
             continue;
+        }
+        if (load && aligned) {
+            off_t pos = lseek(fd, 0, SEEK_CUR);
+            int mapped;
+
+            if (pos < 0) {
+                error_setg_errno(errp, errno, "Locate Sail RAM base");
+                return false;
+            }
+            mapped = ram_block_map_sail_base(rb, fd, pos, errp);
+            if (mapped < 0) {
+                return false;
+            }
+            if (mapped) {
+                if (lseek(fd, rb->used_length, SEEK_CUR) < 0) {
+                    error_setg_errno(errp, errno, "Seek mapped Sail RAM base");
+                    return false;
+                }
+                continue;
+            }
         }
         for (offset = 0; offset < rb->used_length; offset += 1 << 20) {
             size_t size = MIN(1 << 20, rb->used_length - offset);
@@ -1286,7 +1322,7 @@ SailRAMBaseInfo *qmp_x_sail_ram_base_create(const char *filename, const char *id
                                           Error **errp)
 {
     int fd;
-    bool ok;
+    bool ok, aligned;
     off_t size;
 
     if (!sail_base_idle(errp) || !sail_base_id_valid(id, errp) ||
@@ -1308,8 +1344,9 @@ SailRAMBaseInfo *qmp_x_sail_ram_base_create(const char *filename, const char *id
      * Start the new epoch before copying, so any asynchronous writes during
      * capture remain dirty. On failure the caller falls back to full capture.
      */
-    ok = sail_base_begin(id, errp) && sail_base_header(fd, id, false, errp) &&
-         sail_base_blocks(fd, false, false, errp);
+    ok = sail_base_begin(id, errp) &&
+         sail_base_header(fd, id, false, &aligned, errp) &&
+         sail_base_blocks(fd, false, false, aligned, errp);
     if (ok) {
         size = lseek(fd, 0, SEEK_CUR);
         if (size < 0 || ftruncate(fd, size) < 0 || fsync(fd) < 0) {
@@ -1334,7 +1371,7 @@ SailRAMBaseInfo *qmp_x_sail_ram_base_load(const char *filename, const char *id,
 {
     struct stat st;
     int fd;
-    bool ok;
+    bool ok, aligned;
 
     if (!sail_base_idle(errp) || !sail_base_id_valid(id, errp) ||
         !sail_base_geometry(errp)) {
@@ -1355,8 +1392,8 @@ SailRAMBaseInfo *qmp_x_sail_ram_base_load(const char *filename, const char *id,
         close(fd);
         return NULL;
     }
-    ok = sail_base_header(fd, id, true, errp) &&
-         sail_base_blocks(fd, true, true, errp);
+    ok = sail_base_header(fd, id, true, &aligned, errp) &&
+         sail_base_blocks(fd, true, true, aligned, errp);
     if (ok && lseek(fd, 0, SEEK_CUR) != st.st_size) {
         error_setg(errp, "Sail RAM base file size mismatch");
         ok = false;
@@ -1366,7 +1403,8 @@ SailRAMBaseInfo *qmp_x_sail_ram_base_load(const char *filename, const char *id,
         ok = false;
     }
     if (ok) {
-        ok = sail_base_begin(id, errp) && sail_base_blocks(fd, true, false, errp);
+        ok = sail_base_begin(id, errp) &&
+             sail_base_blocks(fd, true, false, aligned, errp);
     }
     close(fd);
     if (!ok) {

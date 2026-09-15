@@ -50,6 +50,8 @@ struct RAMBlock {
     unsigned long *sail_base_dirty;
     ram_addr_t sail_base_length;
     bool sail_base_discarded;
+    /* Private file pages replace anonymous RAM; discard must still zero it. */
+    bool sail_base_mapped;
 
     /*
      * Below fields are only used by mapped-ram migration
@@ -110,6 +112,8 @@ struct RamBlockAttributes {
 
 /* @offset: the offset within the RAMBlock */
 int ram_block_discard_range(RAMBlock *rb, uint64_t offset, size_t length);
+/* 1: mapped lazily, 0: caller must copy, -1: mapping failed. */
+int ram_block_map_sail_base(RAMBlock *rb, int fd, off_t offset, Error **errp);
 /* @offset: the offset within the RAMBlock */
 int ram_block_discard_guest_memfd_range(RAMBlock *rb, uint64_t offset,
                                         size_t length);

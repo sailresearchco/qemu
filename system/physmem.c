@@ -2703,6 +2703,38 @@ void qemu_ram_remap(ram_addr_t addr)
 }
 #endif /* !_WIN32 */
 
+int ram_block_map_sail_base(RAMBlock *rb, int fd, off_t offset, Error **errp)
+{
+#ifdef CONFIG_LINUX
+    void *area;
+    size_t page = qemu_real_host_page_size();
+
+    /* Keep existing allocation/teardown and KVM host addresses. Only replace
+     * ordinary private, fixed anonymous RAM, before incoming CPUs can run.
+     * Small or externally allocated regions use the original copy path.
+     */
+    if (rb->fd >= 0 || rb->flags & (RAM_PREALLOC | RAM_SHARED | RAM_READONLY) ||
+        rb->used_length != rb->max_length || rb->page_size != page ||
+        !QEMU_PTR_IS_ALIGNED(rb->host, page) ||
+        !QEMU_IS_ALIGNED(offset, page) ||
+        !QEMU_IS_ALIGNED(rb->used_length, page)) {
+        return 0;
+    }
+    area = mmap(rb->host, rb->used_length, PROT_READ | PROT_WRITE,
+                MAP_PRIVATE | MAP_FIXED, fd, offset);
+    if (area == MAP_FAILED) {
+        error_setg_errno(errp, errno, "Map Sail RAM base %s", rb->idstr);
+        return -1;
+    }
+    rb->sail_base_mapped = true;
+    memory_try_enable_merging(rb->host, rb->used_length);
+    qemu_ram_setup_dump(rb->host, rb->used_length);
+    return 1;
+#else
+    return 0;
+#endif
+}
+
 /*
  * Return a host pointer to guest's ram.
  * For Xen, foreign mappings get created if they don't already exist.
@@ -4111,6 +4143,22 @@ int ram_block_discard_range(RAMBlock *rb, uint64_t offset, size_t length)
             error_report("%s: Unaligned length: %zx", __func__, length);
             goto err;
         }
+
+#ifdef CONFIG_LINUX
+        if (rb->sail_base_mapped) {
+            /* DONTNEED on MAP_PRIVATE would reveal the old base, not zero
+             * RAM. Replace discarded pages with anonymous zero pages. The
+             * immutable base and other receivers remain untouched; the
+             * epoch was invalidated above, so the next capture is full.
+             */
+            ret = qemu_ram_remap_mmap(rb, offset, length);
+            if (!ret) {
+                memory_try_enable_merging(host_startaddr, length);
+                qemu_ram_setup_dump(host_startaddr, length);
+            }
+            return ret;
+        }
+#endif
 
         errno = ENOTSUP; /* If we are missing MADVISE etc */
 

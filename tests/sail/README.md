@@ -21,3 +21,10 @@ with `--accel kvm --machine q35` on an x86 KVM host. The fixture executes a smal
 counter guest, changes and zeroes RAM, repeats captures, cancels/retries a
 migration, migrates again from the receiver, rejects wrong bases and starts a
 new epoch. It compares all populated RAM bytes. It is not a Sailbox benchmark.
+
+Use `--memory-mib 16384` on a dedicated host to exercise a larger RAM geometry.
+The retry runs guest CPUs during migration, and the receiver must preserve a
+small accumulated dirty set across another move. This fixture does not touch
+all guest RAM after restore: KVM can conservatively dirty newly mapped writable
+pages on their first access, including reads. A full guest workload benchmark
+must measure that case separately; the persistent bitmap does not eliminate it.

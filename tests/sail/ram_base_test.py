@@ -21,14 +21,14 @@ import time
 
 
 class VM:
-    def __init__(self, binary, root, name, bios, accel, incoming=False, machine='microvm'):
+    def __init__(self, binary, root, name, bios, accel, incoming=False, machine='microvm', memory_mib=128):
         self.root = root
         self.name = name
         self.log = (root / (name + '.log')).open('wb')
         qmp = root / (name + '.qmp')
         qtest = root / (name + '.qtest')
         args = [binary, '-machine', machine, '-accel', accel, '-cpu', 'max' if accel == 'tcg' else 'host',
-                '-m', '128M', '-smp', '1', '-nodefaults', '-display', 'none',
+                '-m', str(memory_mib)+'M', '-smp', '1', '-nodefaults', '-display', 'none',
                 '-monitor', 'none', '-serial', 'none', '-bios', str(bios), '-S',
                 '-qmp', f'unix:{qmp},server=on,wait=off',
                 '-qtest', f'unix:{qtest},server=on,wait=off', '-qtest-log', '/dev/null']
@@ -153,6 +153,7 @@ def main():
     parser.add_argument('binary')
     parser.add_argument('--accel', default='tcg', choices=['tcg', 'kvm'])
     parser.add_argument('--machine', default='microvm', choices=['microvm', 'q35'])
+    parser.add_argument('--memory-mib', type=int, default=128)
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='sail-ram-') as tmp, contextlib.ExitStack() as stack:
         root = Path(tmp)
@@ -163,7 +164,7 @@ def main():
         bios = root / 'counter.rom'
         bios.write_bytes(rom)
         def vm(name, incoming=False):
-            value = VM(args.binary, root, name, bios, args.accel, incoming, args.machine)
+            value = VM(args.binary, root, name, bios, args.accel, incoming, args.machine, args.memory_mib)
             stack.callback(value.close)
             return value
         source = vm('source')
@@ -224,13 +225,15 @@ def main():
         assert source.base_info()['dirty-bytes'] == first_dirty
         source.command('migrate-set-parameters', **{'max-bandwidth': 1 << 30})
         retry = root / 'retry.stream'
+        source.command('cont')
         source.save(retry)
         destination = vm('delta', True)
         destination.command('x-sail-ram-base-load', filename=str(base), id=base_id)
         destination.load(retry)
         assert destination.read(16 << 20, len(payload)) == changed
         assert destination.read(0x70000, 4) == source.read(0x70000, 4)
-        assert destination.base_info()['dirty-bytes'] >= first_dirty
+        received_dirty = destination.base_info()['dirty-bytes']
+        assert first_dirty <= received_dirty < 1 << 20, received_dirty
         # Move again from the receiver; earlier changed pages remain required.
         destination.command('cont')
         time.sleep(.1)
@@ -240,6 +243,7 @@ def main():
         destination.command('x-sail-ram-base-select', id=base_id, enabled=True)
         third = root / 'delta3.stream'
         destination.save(third)
+        assert third.stat().st_size < full.stat().st_size // 8, third.stat().st_size
         final = vm('final', True)
         final.command('x-sail-ram-base-load', filename=str(base), id=base_id)
         final.load(third)

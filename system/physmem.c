@@ -2721,7 +2721,8 @@ int ram_block_map_sail_base(RAMBlock *rb, int fd, off_t offset, Error **errp)
         return 0;
     }
     area = mmap(rb->host, rb->used_length, PROT_READ | PROT_WRITE,
-                MAP_PRIVATE | MAP_FIXED, fd, offset);
+                MAP_PRIVATE | MAP_FIXED |
+                (rb->flags & RAM_NORESERVE ? MAP_NORESERVE : 0), fd, offset);
     if (area == MAP_FAILED) {
         error_setg_errno(errp, errno, "Map Sail RAM base %s", rb->idstr);
         return -1;
@@ -2729,6 +2730,10 @@ int ram_block_map_sail_base(RAMBlock *rb, int fd, off_t offset, Error **errp)
     rb->sail_base_mapped = true;
     memory_try_enable_merging(rb->host, rb->used_length);
     qemu_ram_setup_dump(rb->host, rb->used_length);
+    qemu_madvise(rb->host, rb->used_length, QEMU_MADV_HUGEPAGE);
+    if (!qtest_enabled()) {
+        qemu_madvise(rb->host, rb->used_length, QEMU_MADV_DONTFORK);
+    }
     return 1;
 #else
     return 0;
@@ -4155,6 +4160,10 @@ int ram_block_discard_range(RAMBlock *rb, uint64_t offset, size_t length)
             if (!ret) {
                 memory_try_enable_merging(host_startaddr, length);
                 qemu_ram_setup_dump(host_startaddr, length);
+                qemu_madvise(host_startaddr, length, QEMU_MADV_HUGEPAGE);
+                if (!qtest_enabled()) {
+                    qemu_madvise(host_startaddr, length, QEMU_MADV_DONTFORK);
+                }
             }
             return ret;
         }

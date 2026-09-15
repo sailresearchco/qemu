@@ -232,13 +232,14 @@ def main():
         assert memory['Size'] >= args.memory_mib * (1 << 20), memory
         assert memory['Rss'] < 4 << 20, memory
         assert lazy.read(16 << 20, len(payload)) == payload
+        ram_name = 'microvm.ram' if args.machine == 'microvm' else 'pc.ram'
         lazy.write(16 << 20, b'\x55' * 4096)
-        lazy.test(f'sail-ram-discard pc.ram {16 << 20:#x} 4096')
+        lazy.test(f'sail-ram-discard {ram_name} {16 << 20:#x} 4096')
         assert lazy.read(16 << 20, 4096) == bytes(4096)
         assert not lazy.base_info()['valid']
         # Discarding twice must not resurrect the file's original bytes.
         lazy.write(16 << 20, b'\x77' * 4096)
-        lazy.test(f'sail-ram-discard pc.ram {16 << 20:#x} 4096')
+        lazy.test(f'sail-ram-discard {ram_name} {16 << 20:#x} 4096')
         assert lazy.read(16 << 20, 4096) == bytes(4096)
         lazy.close()
         # Old durable bases continue to restore through the eager reader.

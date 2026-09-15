@@ -2290,9 +2290,9 @@
 # @filename: Absolute local base path whose complete bytes the caller
 #     verified.
 #     Aligned SAILRAM2 bases are mapped privately on Linux where
-#     possible. The caller must keep the inode immutable until the VM
-#     exits; unlinking the path after loading is safe. Legacy SAILRAM1
-#     bases are copied.
+#     possible.  The caller must keep the inode immutable until the VM
+#     exits; unlinking the path after loading is safe.  Legacy
+#     SAILRAM1 bases are copied.
 # @id: Expected immutable base identity.
 #
 # Since: 11.0

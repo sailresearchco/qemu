@@ -1535,7 +1535,14 @@ static bool sail_base_export(const char *filename, const char *id,
         }
         for (pos = data; pos < end; ) {
             uint64_t n = MIN(end - pos, chunk_size - pos % chunk_size);
-            if (test_bit(pos / chunk_size, chunks)) {
+            /*
+             * A selected zero chunk is an explicit replacement, not an
+             * inherited chunk. Its index remains in the bitmap, but the fresh
+             * output file can represent its bytes with a sparse hole. Do not
+             * write and fsync zeros only for the owner to discard them later.
+             */
+            if (test_bit(pos / chunk_size, chunks) &&
+                !buffer_is_zero(rb->host + pos - data, n)) {
                 if (lseek(fd, pos, SEEK_SET) < 0 ||
                     !sail_base_io(fd, rb->host + pos - data, n, false, errp)) {
                     goto close;

@@ -9,7 +9,10 @@ Selected streams carry a base identity and are deliberately rejected by stock
 QEMU. Without explicit advancement, failure/cancellation retains dirty history.
 `x-sail-ram-base-advance` arms an incremental local export at the final frozen
 RAM boundary. QEMU writes only explicit changed chunks (including zero chunks)
-and metadata. A second base record announces the successor before the final
+and metadata. Selected zero chunks remain explicit in the replacement bitmap,
+but their output bytes use sparse holes rather than disk writes. The fixture
+checks both their zero content and lack of added payload allocation. A second
+base record announces the successor before the final
 RAM round. Source and receiver retain writes after that boundary for the next
 capture. Shared storage merges replacements into a flattened manifest; QEMU
 never fetches or publishes storage. An unpublished successor cannot match the

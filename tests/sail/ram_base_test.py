@@ -223,6 +223,27 @@ def main():
         assert base.stat().st_size >= 128 << 20
         with base.open('rb') as f:
             base_hash = hashlib.file_digest(f, 'sha256').hexdigest()
+        # Recovery exports must retain explicit zero bytes without allocating
+        # their payload. Both exports include the same nonzero metadata chunks.
+        export_chunk = 1 << 20
+        with base.open('rb') as f:
+            zero_index = None
+            for index in range(1, base.stat().st_size // export_chunk):
+                f.seek(index * export_chunk)
+                if f.read(export_chunk) == bytes(export_chunk):
+                    zero_index = index
+                    break
+        assert zero_index is not None
+        metadata_export = root / 'metadata.export'
+        zero_export = root / 'zero.export'
+        for output, indices in [(metadata_export, []), (zero_export, [zero_index])]:
+            source.command('x-sail-ram-base-export', filename=str(output),
+                           id=base_id, **{'chunk-size': export_chunk, 'chunks': indices})
+        with zero_export.open('rb') as f:
+            f.seek(zero_index * export_chunk)
+            assert f.read(export_chunk) == bytes(export_chunk)
+        assert zero_export.stat().st_size == metadata_export.stat().st_size
+        assert zero_export.stat().st_blocks <= metadata_export.stat().st_blocks + 8
         # Validate lazy mapping before any guest reads could fault base pages.
         lazy = vm('lazy', True)
         started = time.monotonic()

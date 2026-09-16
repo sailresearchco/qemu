@@ -70,3 +70,40 @@ copy-on-write isolation, repeated discard, and reads after the path is unlinked.
 Its explicit qtest socket has a Sail-only discard hook for this boundary; the
 production QMP API does not expose that test operation. This is local lazy
 loading, not a lazy S3 source: Sail still prepares the complete local base.
+
+Experimental indexed advancement (`stream-index: true` on
+`x-sail-ram-base-advance`) writes a SAILIDX1 metadata file instead of RAM
+replacement chunks. Each page points to its latest serialized native payload;
+retransmission replaces the earlier entry, and zeros are explicit. The caller
+flattens these references with the preceding base and retains their immutable
+stream objects. This eliminates a second native RAM export; it does not itself
+implement Sailbox publication, lazy storage loading, or destination activation.
+The ordinary chunk-export mode remains available to existing callers.
+
+The index tracks each page during native serialization and resets the retained
+baseline before the final RAM round. Writes during/after final serialization
+remain dirty for the next capture. Cancellation before that boundary deletes the
+partial index and retains the old epoch. A failed index write after the boundary
+invalidates reuse. An unpublished successor never matches an older committed
+manifest. Mapped RAM, multifd, RDMA, post-copy and compressed RAM encodings are
+not eligible for this index. Native allocations require eight bytes per guest
+page (32 MiB for 16 GiB RAM), in addition to existing migration metadata; a fleet
+consumer must account for these bytes before enabling the capability.
+
+SAILIDX1 is a temporary big-endian binary artifact, closed without fsync:
+
+- 8-byte magic, 64-byte parent identity, 64-byte successor identity;
+- 64-bit logical SAILRAM2 base size and native stream prefix length;
+- 32-bit page size (4096) and RAM-block count;
+- for each block: byte name length, name, 64-bit SAILRAM2 data offset,
+  64-bit RAM length, then one 64-bit entry per page.
+
+Entry zero inherits the predecessor, one replaces the page with zeros, and any
+larger entry points to the 4096 payload bytes at native stream offset `entry-2`.
+Offsets are local to the sequential output file, not migration-wide byte
+statistics. The index includes no CPU/device state and is usable only with its
+matching, successfully completed native stream. The flattened base must replace
+its SAILRAM2 identity and keep the same authenticated RAM-block geometry.
+The fixture checks live old-base restore, flattened new-base restore, a further
+capture, cancellation and replacement of already-transferred nonzero pages by
+both newer payloads and zeros. No fleet latency claim follows from this fixture.

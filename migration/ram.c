@@ -466,6 +466,21 @@ static uint64_t sail_advance_chunk_size;
 static uint64_t sail_advance_file_size;
 static unsigned long *sail_advance_chunks;
 static unsigned long sail_advance_chunk_count;
+static bool sail_advance_index;
+
+typedef struct SailRAMIndexBlock {
+    RAMBlock *rb;
+    uint64_t base_offset;
+    uint64_t *pages;
+} SailRAMIndexBlock;
+
+/*
+ * One uint64 per guest page: 0 inherits the old base, 1 is zero,
+ * otherwise value - 2 is the payload offset in the native stream.
+ * Migration owns these arrays; storage never participates in QEMU.
+ */
+static GArray *sail_ram_index;
+static int sail_ram_index_fd = -1;
 static uint64_t physical_memory_sync_dirty_bitmap(RAMBlock *rb,
                                                   ram_addr_t start,
                                                   ram_addr_t length);
@@ -1166,6 +1181,7 @@ static SailRAMBaseInfo *sail_base_info(void)
     info->valid = sail_base_valid();
     info->selected = sail_base_selected;
     info->advance_supported = true;
+    info->stream_index_supported = true;
     if (info->valid) {
         RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
             info->dirty_bytes += bitmap_count_one(rb->sail_base_dirty,
@@ -1177,10 +1193,12 @@ static SailRAMBaseInfo *sail_base_info(void)
         unsigned long bit;
 
         info->advanced_from = g_strdup(sail_advanced_from);
-        info->has_chunks = true;
+        info->has_stream_index = true;
+        info->stream_index = sail_advance_index;
+        info->has_chunks = !sail_advance_index;
         info->has_file_size = true;
         info->file_size = sail_advance_file_size;
-        info->has_chunk_size = true;
+        info->has_chunk_size = !sail_advance_index;
         info->chunk_size = sail_advance_chunk_size;
         for (bit = find_first_bit(sail_advance_chunks, sail_advance_chunk_count);
              bit < sail_advance_chunk_count;
@@ -1452,6 +1470,145 @@ SailRAMBaseInfo *qmp_x_sail_ram_base_load(const char *filename, const char *id,
 }
 
 /*
+ * Indexing reuses the actual serialized bytes, including retransmissions.
+ * The source's final RAM contents need never be exported a second time.
+ * The page index is 1/512 of RAM, bounded by admitted fixed VM geometry.
+ */
+static void sail_index_cleanup(void)
+{
+    if (sail_ram_index_fd >= 0) {
+        close(sail_ram_index_fd);
+        sail_ram_index_fd = -1;
+        if (sail_advance_file) {
+            unlink(sail_advance_file);
+        }
+    }
+    if (sail_ram_index) {
+        for (unsigned int i = 0; i < sail_ram_index->len; i++) {
+            g_free(g_array_index(sail_ram_index, SailRAMIndexBlock, i).pages);
+        }
+        g_array_free(sail_ram_index, true);
+        sail_ram_index = NULL;
+    }
+}
+
+static bool sail_index_begin(Error **errp)
+{
+    RAMBlock *rb;
+    uint64_t pos = 72;
+    RCU_READ_LOCK_GUARD();
+
+    sail_ram_index_fd = open(sail_advance_file,
+                            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (sail_ram_index_fd < 0) {
+        error_setg_errno(errp, errno, "Create Sail RAM index");
+        return false;
+    }
+    sail_ram_index = g_array_new(false, false, sizeof(SailRAMIndexBlock));
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        SailRAMIndexBlock block = { .rb = rb };
+        pos = QEMU_ALIGN_UP(pos + 1 + strlen(rb->idstr) + 8, 4096);
+        block.base_offset = pos;
+        block.pages = g_try_new0(uint64_t, rb->used_length >> TARGET_PAGE_BITS);
+        if (!block.pages) {
+            error_setg(errp, "Allocate Sail RAM page index");
+            sail_index_cleanup();
+            return false;
+        }
+        g_array_append_val(sail_ram_index, block);
+        pos += rb->used_length;
+    }
+    sail_advance_file_size = pos;
+    return true;
+}
+
+static void sail_index_page(RAMBlock *rb, ram_addr_t offset, uint64_t value)
+{
+    if (!sail_ram_index) {
+        return;
+    }
+    for (unsigned int i = 0; i < sail_ram_index->len; i++) {
+        SailRAMIndexBlock *block = &g_array_index(sail_ram_index,
+                                                SailRAMIndexBlock, i);
+        if (block->rb == rb) {
+            assert(offset < rb->used_length);
+            block->pages[offset >> TARGET_PAGE_BITS] = value;
+            return;
+        }
+    }
+    g_assert_not_reached();
+}
+
+static void sail_index_advance(void)
+{
+    RAMBlock *rb;
+    RCU_READ_LOCK_GUARD();
+
+    /*
+     * Reset before final serialization, never after: retain device writes
+     * during/after that phase even if this conservatively resends pages.
+     */
+    RAMBLOCK_FOREACH_NOT_IGNORED(rb) {
+        bitmap_zero(rb->sail_base_dirty,
+                    rb->max_length >> TARGET_PAGE_BITS);
+    }
+    pstrcpy(sail_advanced_from, sizeof(sail_advanced_from), sail_base_id);
+    pstrcpy(sail_base_id, sizeof(sail_base_id), sail_advance_id);
+    g_clear_pointer(&sail_advance_chunks, g_free);
+    sail_advance_chunk_count = 0;
+}
+
+static bool sail_index_finish(QEMUFile *f, Error **errp)
+{
+    uint8_t header[160] = "SAILIDX1";
+    uint64_t buffer[4096];
+    int fd = sail_ram_index_fd;
+
+    memcpy(header + 8, sail_advanced_from, 64);
+    memcpy(header + 72, sail_base_id, 64);
+    stq_be_p(header + 136, sail_advance_file_size);
+    stq_be_p(header + 144, qemu_file_output_position(f));
+    stl_be_p(header + 152, TARGET_PAGE_SIZE);
+    stl_be_p(header + 156, sail_ram_index->len);
+    if (!sail_base_io(fd, header, sizeof(header), false, errp)) {
+        return false;
+    }
+    for (unsigned int i = 0; i < sail_ram_index->len; i++) {
+        SailRAMIndexBlock *block = &g_array_index(sail_ram_index,
+                                                SailRAMIndexBlock, i);
+        uint8_t name_len = strlen(block->rb->idstr);
+        uint64_t geometry[2] = { cpu_to_be64(block->base_offset),
+                                cpu_to_be64(block->rb->used_length) };
+        uint64_t pages = block->rb->used_length >> TARGET_PAGE_BITS;
+
+        if (!sail_base_io(fd, &name_len, 1, false, errp) ||
+            !sail_base_io(fd, block->rb->idstr, name_len, false, errp) ||
+            !sail_base_io(fd, geometry, sizeof(geometry), false, errp)) {
+            return false;
+        }
+        for (uint64_t page = 0; page < pages; ) {
+            size_t n = MIN(pages - page, G_N_ELEMENTS(buffer));
+            for (size_t j = 0; j < n; j++) {
+                buffer[j] = cpu_to_be64(block->pages[page + j]);
+            }
+            if (!sail_base_io(fd, buffer, n * sizeof(buffer[0]), false, errp)) {
+                return false;
+            }
+            page += n;
+        }
+    }
+    if (close(fd) < 0) {
+        sail_ram_index_fd = -1;
+        unlink(sail_advance_file);
+        error_setg_errno(errp, errno, "Close Sail RAM index");
+        return false;
+    }
+    sail_ram_index_fd = -1;
+    g_clear_pointer(&sail_advance_file, g_free);
+    return true;
+}
+
+/*
  * Export selected file chunks, not a scan of all RAM. Metadata chunks are
  * always included. Holes elsewhere mean "inherit", including when a selected
  * chunk itself contains zeros; the explicit bitmap distinguishes those cases.
@@ -1589,6 +1746,7 @@ out:
 
 void qmp_x_sail_ram_base_advance(const char *filename, const char *parent_id,
                                const char *id, uint64_t chunk_size,
+                               bool has_stream_index, bool stream_index,
                                Error **errp)
 {
     if (!sail_base_idle(errp) || !sail_base_id_valid(id, errp) ||
@@ -1607,6 +1765,7 @@ void qmp_x_sail_ram_base_advance(const char *filename, const char *parent_id,
     sail_advance_file = g_strdup(filename);
     pstrcpy(sail_advance_id, sizeof(sail_advance_id), id);
     sail_advance_chunk_size = chunk_size;
+    sail_advance_index = has_stream_index && stream_index;
     sail_advanced_from[0] = 0;
 }
 
@@ -1868,6 +2027,7 @@ static int save_zero_page(RAMState *rs, PageSearchStatus *pss,
 
     len += save_page_header(pss, file, pss->block, offset | RAM_SAVE_FLAG_ZERO);
     qemu_put_byte(file, 0);
+    sail_index_page(pss->block, offset, 1);
     len += 1;
     ram_release_page(pss->block->idstr, offset);
     ram_transferred_add(len);
@@ -1908,6 +2068,10 @@ static int save_normal_page(PageSearchStatus *pss, RAMBlock *block,
     } else {
         ram_transferred_add(save_page_header(pss, pss->pss_channel, block,
                                              offset | RAM_SAVE_FLAG_PAGE));
+        if (sail_ram_index) {
+            sail_index_page(block, offset,
+                            qemu_file_output_position(file) + 2);
+        }
         if (async) {
             qemu_put_buffer_async(file, buf, TARGET_PAGE_SIZE,
                                   migrate_release_ram() &&
@@ -3089,6 +3253,7 @@ static void ram_save_cleanup(void *opaque)
 {
     RAMState **rsp = opaque;
 
+    sail_index_cleanup();
     g_clear_pointer(&sail_advance_file, g_free);
     /* We don't use dirty log with background snapshots */
     if (!migrate_background_snapshot()) {
@@ -3763,6 +3928,16 @@ static int ram_save_setup(QEMUFile *f, void *opaque, Error **errp)
         error_setg(errp, "Sail RAM base is invalid or migration mode is unsupported");
         return -1;
     }
+    if (sail_advance_file && sail_advance_index) {
+        if (!sail_base_selected || migrate_multifd() || migrate_rdma()) {
+            error_setg(errp,
+                       "Sail RAM index requires selected single-stream RAM");
+            return -1;
+        }
+        if (!sail_index_begin(errp)) {
+            return -1;
+        }
+    }
     if (ram_init_all(rsp, errp) != 0) {
         return -1;
     }
@@ -4041,9 +4216,14 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
 
         if (sail_advance_file) {
             Error *error = NULL;
+            if (sail_advance_index) {
+                sail_index_advance();
+            }
             if (!sail_base_selected ||
-                !sail_base_export(sail_advance_file, sail_advance_id,
-                                  sail_advance_chunk_size, NULL, true, &error)) {
+                (!sail_advance_index &&
+                 !sail_base_export(sail_advance_file, sail_advance_id,
+                                   sail_advance_chunk_size, NULL, true,
+                                   &error))) {
                 if (error) {
                     error_report_err(error);
                 }
@@ -4053,7 +4233,9 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
             /* A second base record is the new epoch's frozen boundary. */
             qemu_put_be64(f, RAM_SAVE_FLAG_SAIL_BASE);
             qemu_put_buffer(f, (const uint8_t *)sail_base_id, 64);
-            g_clear_pointer(&sail_advance_file, g_free);
+            if (!sail_advance_index) {
+                g_clear_pointer(&sail_advance_file, g_free);
+            }
             migration_bitmap_sync_precopy(true);
         }
 
@@ -4112,6 +4294,15 @@ static int ram_save_complete(QEMUFile *f, void *opaque)
         }
     }
 
+    if (sail_ram_index) {
+        Error *error = NULL;
+        if (!sail_index_finish(f, &error)) {
+            sail_base_id[0] = 0; /* An unpublished epoch cannot be reused. */
+            error_report_err(error);
+            qemu_file_set_error(f, -EIO);
+            return -EIO;
+        }
+    }
     qemu_put_be64(f, RAM_SAVE_FLAG_EOS);
 
     trace_ram_save_complete(rs->migration_dirty_pages, 1);

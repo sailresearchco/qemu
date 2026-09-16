@@ -2253,6 +2253,10 @@
 #
 # @advance-supported: Whether incremental base advancement is
 #     supported.
+# @stream-index-supported: Whether advancement can index native RAM
+#     payloads.
+# @stream-index: Whether the latest advancement produced a stream
+#     index.
 # @advanced-from: Previous identity when the last capture advanced
 #     its base.
 # @file-size: Logical size of the advanced local base file.
@@ -2264,7 +2268,8 @@
 ##
 { 'struct': 'SailRAMBaseInfo', 'data':
   { 'id': 'str', 'valid': 'bool', 'selected': 'bool', 'dirty-bytes': 'uint64',
-    'advance-supported': 'bool', '*advanced-from': 'str',
+    'advance-supported': 'bool', 'stream-index-supported': 'bool',
+    '*stream-index': 'bool', '*advanced-from': 'str',
     '*file-size': 'uint64', '*chunk-size': 'uint64',
     '*chunks': ['uint64'] } }
 
@@ -2363,12 +2368,16 @@
 # @parent-id: Expected current base identity.
 # @id: Unique new base identity.
 # @chunk-size: Power of two between 4096 and 67108864 bytes.
+# @stream-index: Write a SAILIDX1 page-to-native-stream index instead
+#     of RAM replacement chunks.  The caller must retain the indexed
+#     native stream and flatten page references with the old base.
+#     No RAM payload is copied to this file.  Defaults to false.
 #
 # Since: 11.0
 ##
 { 'command': 'x-sail-ram-base-advance',
   'data': { 'filename': 'str', 'parent-id': 'str', 'id': 'str',
-            'chunk-size': 'uint64' } }
+            'chunk-size': 'uint64', '*stream-index': 'bool' } }
 
 ##
 # @x-sail-ram-base-export:

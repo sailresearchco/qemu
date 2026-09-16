@@ -15,6 +15,7 @@ from pathlib import Path
 import random
 import shutil
 import socket
+import struct
 import subprocess
 import tempfile
 import time
@@ -182,6 +183,47 @@ def mapped_base_memory(vm, filename):
             if key in values:
                 values[key] += int(value.split()[0]) * 1024
     return values
+
+
+def indexed_base(parent, stream, index, output, parent_id, successor_id):
+    """Flatten the native index using serialized bytes, never source RAM."""
+    shutil.copyfile(parent, output)
+    counts = {'inherited': 0, 'zero': 0, 'payload': 0}
+    with index.open('rb') as inp, stream.open('rb') as payload, output.open('r+b') as dst:
+        header = inp.read(160)
+        assert header[:8] == b'SAILIDX1'
+        assert header[8:72].decode() == parent_id
+        assert header[72:136].decode() == successor_id
+        size, prefix_size, page_size, blocks = struct.unpack('>QQII', header[136:])
+        assert size == parent.stat().st_size and page_size == 4096
+        assert prefix_size <= stream.stat().st_size
+        dst.seek(8)
+        dst.write(successor_id.encode())
+        previous_end = 72
+        for _ in range(blocks):
+            name_length = inp.read(1)[0]
+            name = inp.read(name_length)
+            offset, length = struct.unpack('>QQ', inp.read(16))
+            assert name and offset >= previous_end and offset % page_size == 0
+            assert length % page_size == 0 and offset + length <= size
+            previous_end = offset + length
+            for page, (entry,) in enumerate(struct.iter_unpack('>Q', inp.read(length // page_size * 8))):
+                if entry == 0:
+                    counts['inherited'] += 1
+                    continue
+                if entry == 1:
+                    data = bytes(page_size)
+                    counts['zero'] += 1
+                else:
+                    assert entry - 2 + page_size <= prefix_size
+                    payload.seek(entry - 2)
+                    data = payload.read(page_size)
+                    assert len(data) == page_size
+                    counts['payload'] += 1
+                dst.seek(offset + page * page_size)
+                dst.write(data)
+        assert not inp.read(1)
+    return counts
 
 
 def main():
@@ -437,6 +479,84 @@ def main():
             raise AssertionError('failed export reported success')
         assert destination.base_info()['id'] == advance_id
 
+        # Indexed advancement reuses the native stream, including the latest
+        # retransmission and explicit zeros. It never exports RAM chunks.
+        assert destination.base_info()['stream-index-supported']
+        index_id = hashlib.sha256(b'indexed-epoch').hexdigest()
+        index_path = root / 'advance.index'
+        index_stream = root / 'indexed.stream'
+        indexed_expected = bytearray(expected_advanced)
+        indexed_expected[65536:327680] = random.Random(91).randbytes(262144)
+        destination.write((16 << 20) + 65536, indexed_expected[65536:327680])
+        indexed_dirty = destination.base_info()['dirty-bytes']
+        destination.command('x-sail-ram-base-advance', filename=str(index_path),
+                            **{'parent-id': advance_id, 'id': index_id,
+                               'chunk-size': chunk_size, 'stream-index': True})
+        destination.command('migrate-set-parameters', **{'max-bandwidth': 65536})
+        destination.command('cont')
+        destination.command('migrate', uri='file:' + str(root / 'index-cancel.stream'))
+        time.sleep(.05)
+        destination.command('migrate_cancel')
+        destination.wait_migration('cancelled')
+        cancelled = destination.base_info()
+        assert cancelled['id'] == advance_id and cancelled['dirty-bytes'] >= indexed_dirty
+        assert not index_path.exists(), 'cancel left an apparently complete index'
+        # Retry must allocate a fresh index and preserve the old dirty set.
+        destination.command('x-sail-ram-base-advance', filename=str(index_path),
+                            **{'parent-id': advance_id, 'id': index_id,
+                               'chunk-size': chunk_size, 'stream-index': True})
+        destination.command('migrate', uri='file:' + str(index_stream))
+        until = time.monotonic() + 10
+        while time.monotonic() < until:
+            moving = destination.command('query-migrate')
+            if moving.get('ram', {}).get('normal-bytes', 0) >= 16384:
+                assert moving['status'] == 'active', moving
+                break
+            time.sleep(.01)
+        else:
+            raise AssertionError('indexed transfer did not begin')
+        # These early pages have already been serialized. Their final index
+        # must point at the later payload or zero, never the stale first pass.
+        indexed_expected[65536:69632] = b'\x92' * 4096
+        indexed_expected[69632:73728] = bytes(4096)
+        destination.write((16 << 20) + 65536, indexed_expected[65536:73728])
+        destination.command('migrate-set-parameters', **{'max-bandwidth': 1 << 30})
+        indexed_migration = destination.wait_migration()
+        indexed_info = destination.base_info()
+        assert indexed_info['id'] == index_id and indexed_info['stream-index']
+        assert 'chunks' not in indexed_info and 'chunk-size' not in indexed_info
+        indexed_output = root / 'indexed.ram'
+        index_counts = indexed_base(advanced_base, index_stream, index_path,
+                                    indexed_output, advance_id, index_id)
+        assert index_counts['zero'] > 0 and index_counts['payload'] > 0
+        assert index_path.stat().st_size < advanced_base.stat().st_size // 256
+        assert indexed_migration['ram']['normal-bytes'] > index_counts['payload'] * 4096
+        for name, seed, seed_id, stream_id in [
+            ('indexed-live', advanced_base, advance_id, None),
+            ('indexed-durable', indexed_output, index_id, advance_id),
+        ]:
+            receiver = vm(name, True)
+            kwargs = {'stream-id': stream_id} if stream_id else {}
+            receiver.command('x-sail-ram-base-load', filename=str(seed),
+                             id=seed_id, **kwargs)
+            receiver.load(index_stream)
+            assert receiver.base_info()['id'] == index_id
+            assert receiver.read(16 << 20, len(payload)) == indexed_expected
+            assert receiver.read(0x70000, 4) == destination.read(0x70000, 4)
+        # The indexed successor is a real next baseline, not just a restore aid.
+        destination.command('cont')
+        time.sleep(.02)
+        destination.command('stop')
+        destination.write((16 << 20) + 65536, b'\x93' * 4096)
+        indexed_expected[65536:69632] = b'\x93' * 4096
+        destination.command('x-sail-ram-base-select', id=index_id, enabled=True)
+        after_index = root / 'after-index.stream'
+        destination.save(after_index)
+        next_receiver = vm('after-index', True)
+        next_receiver.command('x-sail-ram-base-load', filename=str(indexed_output), id=index_id)
+        next_receiver.load(after_index)
+        assert next_receiver.read(16 << 20, len(payload)) == indexed_expected
+
         # Unseeded receiver must fail closed instead of filling unchanged RAM
         # with zeros and reporting a completed migration.
         wrong = vm('unseeded', True)
@@ -463,7 +583,8 @@ def main():
         print(json.dumps({'accel': args.accel, 'machine': args.machine, 'full_bytes': full.stat().st_size,
                           'delta_bytes': delta.stat().st_size, 'followup_bytes': third.stat().st_size,
                           'first_dirty_bytes': first_dirty, 'lazy_load_seconds': lazy_seconds,
-                          'base_mapping': memory, 'correctness': 'passed'}))
+                          'base_mapping': memory, 'index_bytes': index_path.stat().st_size,
+                          'index_counts': index_counts, 'correctness': 'passed'}))
 
 
 if __name__ == '__main__':

@@ -45,6 +45,7 @@ typedef struct FdEntry {
 struct QEMUFile {
     QIOChannel *ioc;
     bool is_writable;
+    uint64_t sequential_written;
 
     int buf_index;
     int buf_size; /* 0 when writing */
@@ -295,6 +296,7 @@ int qemu_fflush(QEMUFile *f)
             qemu_file_set_error_obj(f, -EIO, local_error);
         } else {
             uint64_t size = iov_size(f->iov, f->iovcnt);
+            f->sequential_written += size;
             qatomic_add(&mig_stats.qemu_file_transferred, size);
         }
 
@@ -790,6 +792,12 @@ int coroutine_mixed_fn qemu_get_byte(QEMUFile *f)
     result = qemu_peek_byte(f, 0);
     qemu_file_skip(f, 1);
     return result;
+}
+
+uint64_t qemu_file_output_position(QEMUFile *f)
+{
+    g_assert(qemu_file_is_writable(f));
+    return f->sequential_written + iov_size(f->iov, f->iovcnt);
 }
 
 uint64_t qemu_file_transferred(QEMUFile *f)

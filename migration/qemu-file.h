@@ -45,6 +45,13 @@ G_DEFINE_AUTOPTR_CLEANUP_FUNC(QEMUFile, qemu_fclose)
 uint64_t qemu_file_transferred(QEMUFile *f);
 
 /*
+ * Position in this sequential output, including queued bytes. Unlike global
+ * transfer statistics, this excludes other channels and nested device files.
+ * Positional mapped-RAM writes are outside this contract.
+ */
+uint64_t qemu_file_output_position(QEMUFile *f);
+
+/*
  * put_buffer without copying the buffer.
  * The buffer should be available till it is sent asynchronously.
  */

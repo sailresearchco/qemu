@@ -332,6 +332,90 @@ def main():
         final.load(third)
         assert final.read(16 << 20, len(payload)) == changed
         assert final.read(0x70000, 4) == destination.read(0x70000, 4)
+        # Advancing a base replaces only changed chunks, and the flattened
+        # successor can restore without fetching its parent's manifest.
+        advance_id = hashlib.sha256(b'advanced-epoch').hexdigest()
+        advance_file = root / 'advance.chunks'
+        chunk_size = 1 << 20
+        destination.command('x-sail-ram-base-advance', filename=str(advance_file),
+                            **{'parent-id': base_id, 'id': advance_id,
+                               'chunk-size': chunk_size})
+        advanced_stream = root / 'advanced.stream'
+        destination.command('cont')
+        time.sleep(.02)
+        destination.command('stop')
+        destination.save(advanced_stream)
+        advanced = destination.base_info()
+        assert advanced['id'] == advance_id, advanced
+        assert advanced['advanced-from'] == base_id, advanced
+        assert advanced['dirty-bytes'] < first_dirty, advanced
+        assert len(advanced['chunks']) < advanced['file-size'] // chunk_size // 4
+        advanced_base = root / 'advanced.ram'
+        shutil.copyfile(base, advanced_base)
+        with advanced_base.open('r+b') as output, advance_file.open('rb') as patch:
+            for index in advanced['chunks']:
+                offset = index * chunk_size
+                patch.seek(offset)
+                output.seek(offset)
+                data = patch.read(min(chunk_size, advanced['file-size'] - offset))
+                output.write(data)
+        # Both old-base streaming and new-base durable restore reach the same
+        # RAM state and new dirty epoch.
+        for name, seed, seed_id, stream_id in [
+            ('advanced-live', base, base_id, None),
+            ('advanced-durable', advanced_base, advance_id, base_id),
+        ]:
+            receiver = vm(name, True)
+            kwargs = {'stream-id': stream_id} if stream_id else {}
+            receiver.command('x-sail-ram-base-load', filename=str(seed),
+                             id=seed_id, **kwargs)
+            receiver.load(advanced_stream)
+            assert receiver.base_info()['id'] == advance_id
+            assert receiver.read(16 << 20, len(payload)) == changed
+            assert receiver.read(0x70000, 4) == destination.read(0x70000, 4)
+        missing_marker = vm('missing-advance-record', True)
+        missing_marker.command('x-sail-ram-base-load',
+                               filename=str(advanced_base), id=advance_id,
+                               **{'stream-id': base_id})
+        try:
+            missing_marker.load(third)
+        except (OSError, RuntimeError):
+            assert missing_marker.process.wait(timeout=5) != 0
+        else:
+            raise AssertionError('flattened base accepted no advance record')
+        # A later capture never includes the already committed old dirty set.
+        destination.command('cont')
+        time.sleep(.02)
+        destination.command('stop')
+        destination.write((16 << 20) + 65536, b'\x91' * 4096)
+        destination.command('x-sail-ram-base-select', id=advance_id, enabled=True)
+        after_advance = root / 'after-advance.stream'
+        destination.save(after_advance)
+        after_info = destination.base_info()
+        assert 4096 <= after_info['dirty-bytes'] < first_dirty, after_info
+        after_receiver = vm('after-advance', True)
+        after_receiver.command('x-sail-ram-base-load',
+                               filename=str(advanced_base), id=advance_id)
+        after_receiver.load(after_advance)
+        expected_advanced = bytearray(changed)
+        expected_advanced[65536:69632] = b'\x91' * 4096
+        assert after_receiver.read(16 << 20, len(payload)) == expected_advanced
+        # Refusing the output before any reset preserves the current epoch;
+        # no unpublished successor may be reported as usable.
+        destination.command('cont')
+        time.sleep(.02)
+        destination.command('stop')
+        destination.command('x-sail-ram-base-advance', filename='/missing/sail/base',
+                            **{'parent-id': advance_id, 'id': 'd' * 64,
+                               'chunk-size': chunk_size})
+        try:
+            destination.save(root / 'failed-advance.stream')
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError('failed export reported success')
+        assert destination.base_info()['id'] == advance_id
+
         # Unseeded receiver must fail closed instead of filling unchanged RAM
         # with zeros and reporting a completed migration.
         wrong = vm('unseeded', True)

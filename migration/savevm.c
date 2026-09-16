@@ -3060,6 +3060,9 @@ int qemu_loadvm_state(QEMUFile *f, Error **errp)
     }
 
     /* When reaching here, it must be precopy */
+    if (ret == 0 && !ram_sail_base_validate(errp)) {
+        ret = -EINVAL;
+    }
     if (ret == 0) {
         if (migrate_has_error(migrate_get_current()) ||
             !qemu_loadvm_thread_pool_wait(s, mis)) {

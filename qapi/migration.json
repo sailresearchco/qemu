@@ -2251,10 +2251,22 @@
 # @dirty-bytes: Conservative changed RAM byte count; available between
 #     migrations.
 #
+# @advance-supported: Whether incremental base advancement is
+#     supported.
+# @advanced-from: Previous identity when the last capture advanced
+#     its base.
+# @file-size: Logical size of the advanced local base file.
+# @chunk-size: Chunk size of the advanced local base file.
+# @chunks: Explicit replacement chunk indices, including zero
+#     replacements.
+#
 # Since: 11.0
 ##
 { 'struct': 'SailRAMBaseInfo', 'data':
-  { 'id': 'str', 'valid': 'bool', 'selected': 'bool', 'dirty-bytes': 'uint64' } }
+  { 'id': 'str', 'valid': 'bool', 'selected': 'bool', 'dirty-bytes': 'uint64',
+    'advance-supported': 'bool', '*advanced-from': 'str',
+    '*file-size': 'uint64', '*chunk-size': 'uint64',
+    '*chunks': ['uint64'] } }
 
 ##
 # @x-sail-ram-base-create:
@@ -2294,11 +2306,15 @@
 #     exits; unlinking the path after loading is safe.  Legacy
 #     SAILRAM1 bases are copied.
 # @id: Expected immutable base identity.
+# @stream-id: Initial native stream identity when restoring an
+#     advanced
+#     base.  The stream must advance to @id before activation.
 #
 # Since: 11.0
 ##
 { 'command': 'x-sail-ram-base-load',
-  'data': { 'filename': 'str', 'id': 'str' }, 'returns': 'SailRAMBaseInfo' }
+  'data': { 'filename': 'str', 'id': 'str', '*stream-id': 'str' },
+  'returns': 'SailRAMBaseInfo' }
 
 ##
 # @x-sail-ram-base-select:
@@ -2324,3 +2340,51 @@
 # Since: 11.0
 ##
 { 'command': 'query-sail-ram-base', 'returns': 'SailRAMBaseInfo' }
+
+
+##
+# @x-sail-ram-base-advance:
+#
+# Arm incremental base export at the next selected migration's final
+#     RAM
+# boundary.  The native stream announces the new epoch before its
+#     final
+# RAM round.  The file contains only explicit replacement chunks;
+#     query
+# the base after native cleanup for their indices.  The owner merges
+#     them
+# with the parent's unchanged chunks before publishing.  Failed
+#     capture
+# never authorizes reuse of an unpublished base.
+#
+# @filename: Fresh absolute local output path.
+# @parent-id: Expected current base identity.
+# @id: Unique new base identity.
+# @chunk-size: Power of two between 4096 and 67108864 bytes.
+#
+# Since: 11.0
+##
+{ 'command': 'x-sail-ram-base-advance',
+  'data': { 'filename': 'str', 'parent-id': 'str', 'id': 'str',
+            'chunk-size': 'uint64' } }
+
+##
+# @x-sail-ram-base-export:
+#
+# Export selected chunks of paused RAM without changing its dirty
+#     epoch.
+# The caller must verify these bytes against the authoritative
+#     artifact
+# before caching them; destination device fixups can change guest RAM.
+#
+# @filename: Fresh absolute local output path.
+# @id: Expected current base identity.
+# @chunk-size: Power of two between 4096 and 67108864 bytes.
+# @chunks: Chunk indices to materialize, in addition to metadata
+#     chunks.
+#
+# Since: 11.0
+##
+{ 'command': 'x-sail-ram-base-export',
+  'data': { 'filename': 'str', 'id': 'str', 'chunk-size': 'uint64',
+            'chunks': ['uint64'] } }

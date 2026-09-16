@@ -6,8 +6,22 @@ The x-sail-ram-base-* QMP commands retain a conservative RAM dirty bitmap across
 migration jobs. Creating a base requires paused CPUs; loading requires a fresh
 incoming VM. Normal streams remain normal unless a base is explicitly selected.
 Selected streams carry a base identity and are deliberately rejected by stock
-QEMU. Source failure/cancellation does not consume the epoch. The receiver keeps
-all pages changed relative to the base, so another migration can use that base.
+QEMU. Without explicit advancement, failure/cancellation retains dirty history.
+`x-sail-ram-base-advance` arms an incremental local export at the final frozen
+RAM boundary. QEMU writes only explicit changed chunks (including zero chunks)
+and metadata. A second base record announces the successor before the final
+RAM round. Source and receiver retain writes after that boundary for the next
+capture. Shared storage merges replacements into a flattened manifest; QEMU
+never fetches or publishes storage. An unpublished successor cannot match the
+owner's committed checkpoint identity and therefore cannot be reused.
+
+A live receiver starts from the old base. A durable restore can start from the
+flattened successor and specify the predecessor as `stream-id`; it still replays
+the complete native stream and must observe the matching advance record. No
+intermediate checkpoint manifests or device-state chain are needed. The owner
+may export selected paused destination chunks for recovery caching, but must
+verify their hashes: final-round writes and device-load fixups can differ from
+the captured base. Such mismatches require the authoritative source bytes.
 
 The caller authenticates the immutable base's bytes and manages storage,
 publication, disk consistency and which worker may run the VM. IDs are unique

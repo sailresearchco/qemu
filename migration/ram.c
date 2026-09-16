@@ -1551,7 +1551,14 @@ static bool sail_base_export(const char *filename, const char *id,
             pos += n;
         }
     }
-    if (ftruncate(fd, size) < 0 || fsync(fd) < 0) {
+    /*
+     * This is a temporary transfer artifact, not a durable checkpoint. The
+     * owner reads and authenticates it before publishing separate recovery
+     * objects, then unlinks it. Completing writes and close is sufficient for
+     * that handoff; flushing this disposable copy stalls the frozen guest and
+     * cannot establish durability of the owner's actual recovery objects.
+     */
+    if (ftruncate(fd, size) < 0) {
         error_setg_errno(errp, errno, "Seal Sail RAM advance");
         goto close;
     }

@@ -18,6 +18,13 @@ capture. Shared storage merges replacements into a flattened manifest; QEMU
 never fetches or publishes storage. An unpublished successor cannot match the
 owner's committed checkpoint identity and therefore cannot be reused.
 
+Incremental advance and destination export files are temporary local artifacts:
+QEMU completes their writes and closes them, but does not `fsync` this disposable
+copy. The owner authenticates their bytes and establishes recovery availability
+and durable publication using its own objects before releasing the old owner.
+Export success alone has never established a durable Sail checkpoint. The
+initial standalone full-base capture retains its existing file sync behavior.
+
 A live receiver starts from the old base. A durable restore can start from the
 flattened successor and specify the predecessor as `stream-id`; it still replays
 the complete native stream and must observe the matching advance record. No

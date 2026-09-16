@@ -2356,8 +2356,8 @@
 # with the parent's unchanged chunks before publishing.  Failed
 #     capture
 # never authorizes reuse of an unpublished base.
-# The temporary file is closed but not fsynced; the caller owns durable
-# publication of the resulting checkpoint.
+# The temporary file is closed but not fsynced.  The caller owns
+# durable publication of the resulting checkpoint.
 #
 # @filename: Fresh absolute local output path.
 # @parent-id: Expected current base identity.
@@ -2378,8 +2378,8 @@
 # The caller must verify these bytes against the authoritative
 #     artifact
 # before caching them; destination device fixups can change guest RAM.
-# The temporary file is closed but not fsynced; the caller owns durable
-# publication of the resulting checkpoint.
+# The temporary file is closed but not fsynced.  The caller owns
+# durable publication of the resulting checkpoint.
 #
 # @filename: Fresh absolute local output path.
 # @id: Expected current base identity.

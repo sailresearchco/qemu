@@ -492,10 +492,12 @@ def main():
         destination.command('x-sail-ram-base-advance', filename=str(index_path),
                             **{'parent-id': advance_id, 'id': index_id,
                                'chunk-size': chunk_size, 'stream-index': True})
-        destination.command('migrate-set-parameters', **{'max-bandwidth': 65536})
+        destination.command('migrate-set-parameters', **{'max-bandwidth': 1 << 30})
+        destination.command('migrate-set-capabilities', capabilities=[
+            {'capability': 'pause-before-switchover', 'state': True}])
         destination.command('cont')
         destination.command('migrate', uri='file:' + str(root / 'index-cancel.stream'))
-        time.sleep(.05)
+        destination.wait_migration('pre-switchover')
         destination.command('migrate_cancel')
         destination.wait_migration('cancelled')
         cancelled = destination.base_info()
@@ -505,24 +507,21 @@ def main():
         destination.command('x-sail-ram-base-advance', filename=str(index_path),
                             **{'parent-id': advance_id, 'id': index_id,
                                'chunk-size': chunk_size, 'stream-index': True})
+        if not destination.status()['running']:
+            destination.command('cont')
         destination.command('migrate', uri='file:' + str(index_stream))
-        until = time.monotonic() + 10
-        while time.monotonic() < until:
-            moving = destination.command('query-migrate')
-            if moving.get('ram', {}).get('normal-bytes', 0) >= 16384:
-                assert moving['status'] == 'active', moving
-                break
-            time.sleep(.01)
-        else:
-            raise AssertionError('indexed transfer did not begin')
+        destination.wait_migration('pre-switchover')
+        assert not destination.status()['running']
         # These early pages have already been serialized. Their final index
         # must point at the later payload or zero, never the stale first pass.
         indexed_expected[65536:69632] = b'\x92' * 4096
         indexed_expected[69632:73728] = bytes(4096)
         destination.write((16 << 20) + 65536, indexed_expected[65536:73728])
-        destination.command('migrate-set-parameters', **{'max-bandwidth': 1 << 30})
+        destination.command('migrate-continue', state='pre-switchover')
         indexed_migration = destination.wait_migration()
         indexed_info = destination.base_info()
+        destination.command('migrate-set-capabilities', capabilities=[
+            {'capability': 'pause-before-switchover', 'state': False}])
         assert indexed_info['id'] == index_id and indexed_info['stream-index']
         assert 'chunks' not in indexed_info and 'chunk-size' not in indexed_info
         indexed_output = root / 'indexed.ram'
